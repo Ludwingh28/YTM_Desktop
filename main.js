@@ -1,4 +1,4 @@
-const { app, BrowserWindow, session, Menu, Tray, nativeImage, shell, dialog } = require('electron');
+const { app, BrowserWindow, session, Menu, Tray, nativeImage, shell, dialog, ipcMain } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const fetch = require('cross-fetch');
@@ -22,6 +22,28 @@ const BLOCKED_HOST_PATTERNS = [
 
 let mainWindow = null;
 let tray = null;
+
+// --- Persisted preferences (just close-behavior for now) ---------------
+let settingsCache = null;
+
+function getSettingsPath() {
+  return path.join(app.getPath('userData'), 'settings.json');
+}
+
+function loadSettings() {
+  if (settingsCache) return settingsCache;
+  try {
+    settingsCache = JSON.parse(fs.readFileSync(getSettingsPath(), 'utf-8'));
+  } catch {
+    settingsCache = {};
+  }
+  return settingsCache;
+}
+
+function saveSettings(patch) {
+  settingsCache = { ...loadSettings(), ...patch };
+  fs.writeFileSync(getSettingsPath(), JSON.stringify(settingsCache, null, 2));
+}
 
 // Google refuses to show the sign-in page inside browsers it can identify as
 // "embedded" (Electron, CEF, etc.) — it checks the User-Agent string for the
@@ -205,6 +227,25 @@ function injectAdSkipping(win) {
 
       // Safety net: covers the rare case an ad appears without a matching mutation.
       setInterval(sweep, 2000);
+
+      // Report play/pause state to the main process so the Windows taskbar
+      // thumbnail buttons can show the right icon. Reuses the same
+      // find-the-video-element polling as the observer above instead of
+      // adding a second one.
+      let videoListenerAttached = false;
+      const videoWatchTimer = setInterval(() => {
+        if (videoListenerAttached) {
+          clearInterval(videoWatchTimer);
+          return;
+        }
+        const video = document.querySelector('video');
+        if (!video || !window.ytmDesktop) return;
+        videoListenerAttached = true;
+        clearInterval(videoWatchTimer);
+        video.addEventListener('play', () => window.ytmDesktop.notifyPlaybackState(true));
+        video.addEventListener('pause', () => window.ytmDesktop.notifyPlaybackState(false));
+        window.ytmDesktop.notifyPlaybackState(!video.paused);
+      }, 500);
     })();
   `;
 
@@ -267,11 +308,63 @@ function createTray(win) {
   });
 }
 
+const MEDIA_ICONS_DIR = path.join(__dirname, 'assets', 'media');
+const MEDIA_ICONS = {
+  previous: nativeImage.createFromPath(path.join(MEDIA_ICONS_DIR, 'previous.png')),
+  play: nativeImage.createFromPath(path.join(MEDIA_ICONS_DIR, 'play.png')),
+  pause: nativeImage.createFromPath(path.join(MEDIA_ICONS_DIR, 'pause.png')),
+  next: nativeImage.createFromPath(path.join(MEDIA_ICONS_DIR, 'next.png')),
+};
+
+function buildThumbarButtons(win, isPlaying) {
+  return [
+    {
+      tooltip: 'Anterior',
+      icon: MEDIA_ICONS.previous,
+      click: () => win.webContents.executeJavaScript("document.querySelector('.previous-button')?.click();"),
+    },
+    {
+      tooltip: isPlaying ? 'Pausar' : 'Reproducir',
+      icon: isPlaying ? MEDIA_ICONS.pause : MEDIA_ICONS.play,
+      click: () => win.webContents.executeJavaScript("document.querySelector('.play-pause-button')?.click();"),
+    },
+    {
+      tooltip: 'Siguiente',
+      icon: MEDIA_ICONS.next,
+      click: () => win.webContents.executeJavaScript("document.querySelector('.next-button')?.click();"),
+    },
+  ];
+}
+
+function setupThumbarControls(win) {
+  if (process.platform !== 'win32') return;
+
+  win.setThumbarButtons(buildThumbarButtons(win, false));
+
+  ipcMain.on('playback-state-changed', (event, isPlaying) => {
+    if (event.sender !== win.webContents) return;
+    win.setThumbarButtons(buildThumbarButtons(win, isPlaying));
+  });
+}
+
 function createMenu(win) {
   const template = [
     {
       label: 'Archivo',
-      submenu: [{ role: 'quit', label: 'Salir' }],
+      submenu: [
+        {
+          label: 'Preguntar de nuevo al cerrar la ventana',
+          click: () => {
+            saveSettings({ closeBehavior: undefined });
+            dialog.showMessageBox(win, {
+              type: 'info',
+              message: 'Listo. La próxima vez que cierres la ventana te preguntaré de nuevo qué hacer.',
+            });
+          },
+        },
+        { type: 'separator' },
+        { role: 'quit', label: 'Salir' },
+      ],
     },
     {
       label: 'Ver',
@@ -321,7 +414,7 @@ async function createWindow() {
     minWidth: 800,
     minHeight: 560,
     backgroundColor: '#030303',
-    autoHideMenuBar: true,
+    autoHideMenuBar: false,
     icon: ICON_PATH,
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
@@ -346,6 +439,7 @@ async function createWindow() {
 
   createMenu(mainWindow);
   createTray(mainWindow);
+  setupThumbarControls(mainWindow);
   injectAdSkipping(mainWindow);
 
   // Open external links (ads, "sign in" popups, etc.) in the system browser
@@ -359,10 +453,45 @@ async function createWindow() {
   });
 
   mainWindow.on('close', (event) => {
-    if (!app.isQuiting) {
-      event.preventDefault();
+    if (app.isQuiting) return;
+    event.preventDefault();
+
+    const { closeBehavior } = loadSettings();
+    if (closeBehavior === 'tray') {
       mainWindow.hide();
+      return;
     }
+    if (closeBehavior === 'quit') {
+      app.isQuiting = true;
+      app.quit();
+      return;
+    }
+
+    dialog
+      .showMessageBox(mainWindow, {
+        type: 'question',
+        title: 'Cerrar YTM Desktop',
+        message: '¿Qué quieres hacer al cerrar la ventana?',
+        detail:
+          'Puedes seguir escuchando música en segundo plano (la app queda en la bandeja del sistema), o salir por completo.',
+        buttons: ['Reproducir en segundo plano', 'Salir de la app'],
+        defaultId: 0,
+        cancelId: 0,
+        checkboxLabel: 'Recordar mi elección y no volver a preguntar',
+        checkboxChecked: false,
+      })
+      .then(({ response, checkboxChecked }) => {
+        const choice = response === 0 ? 'tray' : 'quit';
+        if (checkboxChecked) {
+          saveSettings({ closeBehavior: choice });
+        }
+        if (choice === 'tray') {
+          mainWindow.hide();
+        } else {
+          app.isQuiting = true;
+          app.quit();
+        }
+      });
   });
 
   await mainWindow.loadURL(YTM_URL);
