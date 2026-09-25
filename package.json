@@ -1,0 +1,38 @@
+{
+  "name": "ytm-desktop",
+  "version": "1.0.0",
+  "description": "YouTube Music de escritorio sin anuncios, con Electron",
+  "main": "main.js",
+  "private": true,
+  "scripts": {
+    "start": "electron .",
+    "make-icon": "node scripts/make-icon.js",
+    "dist": "electron-builder"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "build": {
+    "appId": "com.ludwing.ytmdesktop",
+    "productName": "YTM Desktop",
+    "files": [
+      "main.js",
+      "preload.js",
+      "assets/**/*"
+    ],
+    "icon": "assets/icon.png",
+    "win": {
+      "target": "nsis"
+    }
+  },
+  "devDependencies": {
+    "electron": "44.4.5",
+    "electron-builder": "26.15.3"
+  },
+  "dependencies": {
+    "@ghostery/adblocker-electron": "2.18.2",
+    "cross-fetch": "4.1.0",
+    "electron-window-state": "5.0.3"
+  }
+}
