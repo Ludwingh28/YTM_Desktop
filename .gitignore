@@ -2,3 +2,6 @@ node_modules/
 dist/
 out/
 *.log
+
+# Notas internas de uso propio, nunca se suben al repo
+PUBLICAR_RELEASE.md

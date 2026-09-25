@@ -10,8 +10,8 @@
     "dist": "electron-builder"
   },
   "keywords": [],
-  "author": "",
-  "license": "ISC",
+  "author": "Ludwing Herrera Justiniano",
+  "license": "MIT",
   "type": "commonjs",
   "build": {
     "appId": "com.ludwing.ytmdesktop",
