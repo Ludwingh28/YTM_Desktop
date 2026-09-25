@@ -24,6 +24,11 @@
     "icon": "assets/icon.png",
     "win": {
       "target": "nsis"
+    },
+    "publish": {
+      "provider": "github",
+      "owner": "Ludwingh28",
+      "repo": "YTM_Desktop"
     }
   },
   "devDependencies": {
@@ -33,6 +38,7 @@
   "dependencies": {
     "@ghostery/adblocker-electron": "2.18.2",
     "cross-fetch": "4.1.0",
+    "electron-updater": "6.8.9",
     "electron-window-state": "5.0.3"
   }
 }
