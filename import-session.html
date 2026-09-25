@@ -1,0 +1,111 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8" />
+<title>Importar sesión</title>
+<style>
+  :root {
+    color-scheme: dark;
+  }
+  body {
+    margin: 0;
+    padding: 24px;
+    background: #030303;
+    color: #f1f1f1;
+    font-family: "Segoe UI", Roboto, Arial, sans-serif;
+  }
+  h1 {
+    font-size: 18px;
+    margin: 0 0 12px;
+  }
+  ol {
+    font-size: 13px;
+    line-height: 1.6;
+    color: #cfcfcf;
+    padding-left: 20px;
+    margin: 0 0 16px;
+  }
+  ol a {
+    color: #8ab4f8;
+  }
+  textarea {
+    width: 100%;
+    height: 160px;
+    box-sizing: border-box;
+    background: #1a1a1a;
+    color: #f1f1f1;
+    border: 1px solid #333;
+    border-radius: 6px;
+    padding: 8px;
+    font-family: Consolas, monospace;
+    font-size: 12px;
+    resize: vertical;
+  }
+  .actions {
+    margin-top: 12px;
+    display: flex;
+    gap: 8px;
+    align-items: center;
+  }
+  button {
+    background: #f00;
+    color: white;
+    border: none;
+    border-radius: 18px;
+    padding: 8px 18px;
+    font-size: 13px;
+    cursor: pointer;
+  }
+  button:disabled {
+    opacity: 0.5;
+    cursor: default;
+  }
+  #status {
+    font-size: 13px;
+  }
+  #status.ok { color: #81c995; }
+  #status.error { color: #f28b82; }
+</style>
+</head>
+<body>
+  <h1>Importar sesión de Google</h1>
+  <ol>
+    <li>Instala la extensión <b>Cookie-Editor</b> en tu navegador normal: en Chrome, Edge u Opera se instala desde la Chrome Web Store; en Firefox, Floorp, LibreWolf o Waterfox, desde <b>addons.mozilla.org</b> (Complementos de Firefox). Es la misma extensión, mismo nombre, en ambas tiendas.</li>
+    <li>Entra a <b>music.youtube.com</b> en ese navegador e inicia sesión normalmente ahí (sin problema, es un navegador real).</li>
+    <li>Con la pestaña de música abierta, abre Cookie-Editor, dale a <b>Export</b> → <b>Export as JSON</b> (se copia solo al portapapeles).</li>
+    <li>Pega ese contenido abajo y dale a Importar.</li>
+  </ol>
+  <textarea id="cookies" placeholder="Pega aquí el JSON exportado..."></textarea>
+  <div class="actions">
+    <button id="importBtn">Importar</button>
+    <span id="status"></span>
+  </div>
+  <script>
+    const btn = document.getElementById('importBtn');
+    const status = document.getElementById('status');
+    const textarea = document.getElementById('cookies');
+
+    btn.addEventListener('click', async () => {
+      status.className = '';
+      status.textContent = 'Importando...';
+      btn.disabled = true;
+      try {
+        const result = await window.ytmImport.importCookies(textarea.value);
+        if (result.ok) {
+          status.className = 'ok';
+          status.textContent = `Listo: ${result.count} cookies importadas. Cerrando y recargando...`;
+          setTimeout(() => window.ytmImport.closeAndReload(), 1200);
+        } else {
+          status.className = 'error';
+          status.textContent = 'Error: ' + result.error;
+        }
+      } catch (err) {
+        status.className = 'error';
+        status.textContent = 'Error: ' + (err && err.message ? err.message : String(err));
+      } finally {
+        btn.disabled = false;
+      }
+    });
+  </script>
+</body>
+</html>

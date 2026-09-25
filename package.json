@@ -19,6 +19,8 @@
     "files": [
       "main.js",
       "preload.js",
+      "import-session.html",
+      "import-session-preload.js",
       "assets/**/*"
     ],
     "icon": "assets/icon.png",

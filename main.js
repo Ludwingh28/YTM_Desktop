@@ -8,18 +8,6 @@ const { autoUpdater } = require('electron-updater');
 
 const YTM_URL = 'https://music.youtube.com';
 
-// Extra ad/tracking hosts that YouTube uses for ad delivery and telemetry.
-// The adblocker engine below (EasyList + EasyPrivacy) catches almost everything,
-// but these are blocked unconditionally as a fast, cheap first line of defense.
-const BLOCKED_HOST_PATTERNS = [
-  /(^|\.)doubleclick\.net$/,
-  /(^|\.)googlesyndication\.com$/,
-  /(^|\.)googleadservices\.com$/,
-  /(^|\.)google-analytics\.com$/,
-  /(^|\.)adservice\.google\.com$/,
-  /(^|\.)pagead2\.googlesyndication\.com$/,
-];
-
 let mainWindow = null;
 let tray = null;
 
@@ -56,17 +44,26 @@ function getSpoofedUserAgent() {
     .replace(new RegExp(`\\s*${app.getName()}/${app.getVersion()}`), '');
 }
 
-function isBlockedUrl(urlString) {
-  try {
-    const { hostname, pathname } = new URL(urlString);
-    if (BLOCKED_HOST_PATTERNS.some((re) => re.test(hostname))) return true;
-    if (/\/pagead\//.test(pathname)) return true;
-    if (/\/ptracking/.test(pathname)) return true;
-    if (/get_midroll_info/.test(pathname)) return true;
-    return false;
-  } catch {
-    return false;
-  }
+// The legacy User-Agent string above isn't the only thing browsers send:
+// Chromium also sends "Client Hints" headers (Sec-CH-UA and friends) that
+// separately identify the browser. Electron's own Chromium build reports
+// itself as plain "Chromium" there — it never claims "Google Chrome" — so
+// without this, a request claims to be Chrome in one header and admits it
+// isn't in another. That mismatch is exactly the kind of signal a risk/fraud
+// system (like the one behind Google's sign-in page) can use to flag a
+// session, regardless of how clean the User-Agent string looks.
+function setupClientHintsSpoofing(ses) {
+  const majorVersion = process.versions.chrome.split('.')[0];
+  const clientHints = {
+    'sec-ch-ua': `"Chromium";v="${majorVersion}", "Not?A_Brand";v="24", "Google Chrome";v="${majorVersion}"`,
+    'sec-ch-ua-mobile': '?0',
+    'sec-ch-ua-platform': '"Windows"',
+  };
+
+  ses.webRequest.onBeforeSendHeaders((details, callback) => {
+    const requestHeaders = { ...details.requestHeaders, ...clientHints };
+    callback({ requestHeaders });
+  });
 }
 
 function checkForUpdates({ manual }) {
@@ -101,17 +98,149 @@ function checkForUpdates({ manual }) {
   });
 }
 
+// --- Manual session import (paste cookies exported from a real browser) ---
+// Google's sign-in form actively refuses embedded browsers (see
+// getSpoofedUserAgent/injectUserAgentDataOverride above for how far that
+// arms race goes). The reliable way around it: let the user log in for real
+// in their everyday browser, export the resulting session cookies with an
+// extension like Cookie-Editor, and hand them to us directly — we never
+// touch Google's login form this way, we just reuse an already-trusted
+// session. Only cookies scoped to google.com/youtube.com are accepted.
+
+function isAllowedCookieDomain(domain) {
+  const bare = String(domain || '').replace(/^\./, '').toLowerCase();
+  return bare === 'google.com' || bare.endsWith('.google.com') || bare === 'youtube.com' || bare.endsWith('.youtube.com');
+}
+
+function mapSameSite(value) {
+  const allowed = ['unspecified', 'no_restriction', 'lax', 'strict'];
+  return allowed.includes(value) ? value : 'unspecified';
+}
+
+async function importCookiesFromJson(rawJson) {
+  let cookies;
+  try {
+    cookies = JSON.parse(rawJson);
+  } catch {
+    return { ok: false, error: 'Eso no parece ser JSON válido. Revisa que copiaste el export completo.' };
+  }
+  if (!Array.isArray(cookies)) {
+    return { ok: false, error: 'El JSON debe ser una lista de cookies (como la exporta Cookie-Editor).' };
+  }
+
+  const ses = session.defaultSession;
+  let count = 0;
+  for (const cookie of cookies) {
+    if (!cookie || !cookie.name || !cookie.domain) continue;
+    if (!isAllowedCookieDomain(cookie.domain)) continue;
+
+    const domain = cookie.domain;
+    const bareDomain = domain.replace(/^\./, '');
+    try {
+      await ses.cookies.set({
+        url: `https://${bareDomain}${cookie.path || '/'}`,
+        domain,
+        name: cookie.name,
+        value: cookie.value,
+        path: cookie.path || '/',
+        secure: cookie.secure !== false,
+        httpOnly: !!cookie.httpOnly,
+        expirationDate: cookie.session ? undefined : cookie.expirationDate,
+        sameSite: mapSameSite(cookie.sameSite),
+      });
+      count += 1;
+    } catch (err) {
+      console.error('No se pudo importar la cookie', cookie.name, err);
+    }
+  }
+
+  if (count === 0) {
+    return { ok: false, error: 'No se importó ninguna cookie de google.com/youtube.com. ¿Copiaste el export completo?' };
+  }
+  return { ok: true, count };
+}
+
+let cookieImportWindow = null;
+
+function openCookieImportWindow() {
+  if (cookieImportWindow) {
+    cookieImportWindow.focus();
+    return;
+  }
+
+  cookieImportWindow = new BrowserWindow({
+    width: 560,
+    height: 560,
+    parent: mainWindow,
+    modal: true,
+    autoHideMenuBar: true,
+    backgroundColor: '#030303',
+    title: 'Importar sesión',
+    webPreferences: {
+      preload: path.join(__dirname, 'import-session-preload.js'),
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: true,
+    },
+  });
+
+  cookieImportWindow.setMenu(null);
+  cookieImportWindow.loadFile(path.join(__dirname, 'import-session.html'));
+
+  cookieImportWindow.on('closed', () => {
+    cookieImportWindow = null;
+  });
+}
+
+function setupCookieImport() {
+  ipcMain.handle('ytm:import-cookies', async (_event, rawJson) => importCookiesFromJson(rawJson));
+
+  ipcMain.on('ytm:import-cookies-done', () => {
+    if (cookieImportWindow) cookieImportWindow.close();
+    if (mainWindow) mainWindow.loadURL(YTM_URL);
+  });
+}
+
+const REPO_URL = 'https://github.com/Ludwingh28/YTM_Desktop';
+
+// electron-updater carries whatever we write in the GitHub Release's
+// description as `info.releaseNotes` — this just turns that into plain text
+// for a native dialog (no HTML/Markdown rendering there), trimmed to a
+// reasonable length. Keep release descriptions as plain "- bullet" lines
+// when publishing so they read well here.
+function formatReleaseNotes(releaseNotes) {
+  let text = '';
+  if (typeof releaseNotes === 'string') {
+    text = releaseNotes;
+  } else if (Array.isArray(releaseNotes)) {
+    text = releaseNotes.map((n) => n.note || '').join('\n');
+  }
+  text = text
+    .replace(/<br\s*\/?>/gi, '\n')
+    .replace(/<\/p>/gi, '\n')
+    .replace(/<\/?[^>]+>/g, '')
+    .trim();
+  if (text.length > 600) text = text.slice(0, 600) + '...';
+  return text;
+}
+
 function setupAutoUpdates() {
   autoUpdater.autoDownload = true;
   autoUpdater.autoInstallOnAppQuit = true;
 
   autoUpdater.on('update-downloaded', (info) => {
+    const notes = formatReleaseNotes(info.releaseNotes);
+    const detailParts = [];
+    if (notes) detailParts.push('Qué cambió:\n' + notes);
+    detailParts.push('Se instalará al cerrar la app, o puedes reiniciar ahora para aplicarla ya.');
+    detailParts.push('¿Dudas? Revisa el repositorio: ' + REPO_URL);
+
     dialog
       .showMessageBox(mainWindow, {
         type: 'info',
         title: 'Actualización lista',
         message: `Se descargó la versión ${info.version}.`,
-        detail: 'Se instalará al cerrar la app, o puedes reiniciar ahora para aplicarla ya.',
+        detail: detailParts.join('\n\n'),
         buttons: ['Reiniciar ahora', 'Más tarde'],
         defaultId: 0,
       })
@@ -133,9 +262,14 @@ function setupAutoUpdates() {
 
 async function setupAdblocker(ses) {
   const cacheDir = app.getPath('userData');
-  const cachePath = path.join(cacheDir, 'adblocker-engine.bin');
+  // Ads-only, not "AdsAndTracking": the broader tracking/privacy list (EasyPrivacy)
+  // also blocks generic Google telemetry endpoints like play.google.com/log —
+  // which Google's own sign-in flow uses to report client signals. Blocking that
+  // made Google's fraud detection treat the session as suspicious and reject
+  // login. Ads-only avoids that while still blocking the actual ad requests.
+  const cachePath = path.join(cacheDir, 'adblocker-engine-ads-only.bin');
 
-  const blocker = await ElectronBlocker.fromPrebuiltAdsAndTracking(fetch, {
+  const blocker = await ElectronBlocker.fromPrebuiltAdsOnly(fetch, {
     path: cachePath,
     read: fs.promises.readFile,
     write: fs.promises.writeFile,
@@ -144,9 +278,65 @@ async function setupAdblocker(ses) {
   blocker.enableBlockingInSession(ses);
 }
 
-function setupManualRequestBlocking(ses) {
-  ses.webRequest.onBeforeRequest((details, callback) => {
-    callback({ cancel: isBlockedUrl(details.url) });
+// setupClientHintsSpoofing (above) fixes the Sec-CH-UA *headers*, but the
+// navigator.userAgentData JS object is derived by Chromium internally from
+// its own build branding, not from those headers — a page's own JS reading
+// it directly would still see "Chromium" with no "Google Chrome" brand,
+// which is exactly the kind of client/header mismatch a risk-scoring script
+// (like the one behind Google's sign-in page) could use as a signal. This
+// overrides it to stay consistent, on every navigation in this window
+// (including the later navigation to accounts.google.com), running as early
+// as dom-ready so it's in place well before a human finishes typing an email.
+function injectUserAgentDataOverride(win) {
+  const chromeVersion = process.versions.chrome;
+  const majorVersion = chromeVersion.split('.')[0];
+  const script = `
+    (function () {
+      try {
+        const brands = [
+          { brand: 'Not?A_Brand', version: '24' },
+          { brand: 'Chromium', version: '${majorVersion}' },
+          { brand: 'Google Chrome', version: '${majorVersion}' },
+        ];
+        const fullVersionList = [
+          { brand: 'Not?A_Brand', version: '24.0.0.0' },
+          { brand: 'Chromium', version: '${chromeVersion}' },
+          { brand: 'Google Chrome', version: '${chromeVersion}' },
+        ];
+        const fakeUAData = {
+          brands,
+          mobile: false,
+          platform: 'Windows',
+          getHighEntropyValues: function (hints) {
+            const values = {
+              brands,
+              mobile: false,
+              platform: 'Windows',
+              platformVersion: '10.0.0',
+              architecture: 'x86',
+              bitness: '64',
+              fullVersionList,
+              uaFullVersion: '${chromeVersion}',
+            };
+            const requested = hints && hints.length ? hints : Object.keys(values);
+            const result = {};
+            requested.forEach(function (h) { if (h in values) result[h] = values[h]; });
+            return Promise.resolve(result);
+          },
+          toJSON: function () { return { brands, mobile: false, platform: 'Windows' }; },
+        };
+        Object.defineProperty(Navigator.prototype, 'userAgentData', {
+          get: function () { return fakeUAData; },
+          configurable: true,
+        });
+      } catch (e) {
+        console.error('No se pudo sobreescribir navigator.userAgentData', e);
+      }
+    })();
+  `;
+
+  win.webContents.on('dom-ready', () => {
+    win.webContents.executeJavaScript(script).catch(() => {});
   });
 }
 
@@ -353,6 +543,11 @@ function createMenu(win) {
       label: 'Archivo',
       submenu: [
         {
+          label: 'Importar sesión desde el navegador...',
+          click: () => openCookieImportWindow(),
+        },
+        { type: 'separator' },
+        {
           label: 'Preguntar de nuevo al cerrar la ventana',
           click: () => {
             saveSettings({ closeBehavior: undefined });
@@ -440,6 +635,7 @@ async function createWindow() {
   createMenu(mainWindow);
   createTray(mainWindow);
   setupThumbarControls(mainWindow);
+  injectUserAgentDataOverride(mainWindow);
   injectAdSkipping(mainWindow);
 
   // Open external links (ads, "sign in" popups, etc.) in the system browser
@@ -515,12 +711,13 @@ if (!gotSingleInstanceLock) {
   app.whenReady().then(async () => {
     const ses = session.defaultSession;
 
-    setupManualRequestBlocking(ses);
     try {
       await setupAdblocker(ses);
     } catch (err) {
       console.error('No se pudo inicializar el bloqueador de anuncios:', err);
     }
+    setupClientHintsSpoofing(ses);
+    setupCookieImport();
 
     await createWindow();
     setupAutoUpdates();
