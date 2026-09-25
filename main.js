@@ -1,4 +1,4 @@
-const { app, BrowserWindow, session, Menu, Tray, nativeImage, shell, dialog, ipcMain } = require('electron');
+const { app, BrowserWindow, session, Menu, Tray, nativeImage, shell, dialog, ipcMain, webContents } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const fetch = require('cross-fetch');
@@ -61,8 +61,24 @@ function setupClientHintsSpoofing(ses) {
   };
 
   ses.webRequest.onBeforeSendHeaders((details, callback) => {
-    const requestHeaders = { ...details.requestHeaders, ...clientHints };
-    callback({ requestHeaders });
+    // If the window is already sitting on a Google sign-in page and fires
+    // another request there (e.g. the user hit "retry" after a rejection),
+    // reveal our real Electron UA instead of the spoofed Chrome one.
+    // Counter-intuitively this can help: Google's modern web sign-in flow is
+    // exactly what fingerprints and blocks browsers *pretending* to be
+    // Chrome; a client that honestly identifies as non-standard instead gets
+    // routed to an older, more permissive compatibility sign-in flow.
+    // (Technique adapted from pear-desktop, a similar project.)
+    const requester = details.webContentsId != null ? webContents.fromId(details.webContentsId) : null;
+    const onGoogleSignIn = requester?.getURL().startsWith('https://accounts.google.com');
+    const targetsGoogleSignIn = details.url.startsWith('https://accounts.google.com');
+
+    if (onGoogleSignIn && targetsGoogleSignIn) {
+      callback({ requestHeaders: { ...details.requestHeaders, 'User-Agent': app.userAgentFallback } });
+      return;
+    }
+
+    callback({ requestHeaders: { ...details.requestHeaders, ...clientHints } });
   });
 }
 
